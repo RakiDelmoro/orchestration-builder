@@ -18,7 +18,7 @@ docker container run --rm -p 12345:80 -v "$PWD:/workspace" \
   adaptive-orchestrator
 ```
 
-The bundled `deployment/deployment.json` points `model.apiBase` at `http://llama-server/v1`, a hostname that only resolves on a docker network running a `llama-server` service, so elsewhere the quickstart overrides the endpoint and model name via these variables. Both can instead be configured in the deployment file — fields `model.apiBase` and `model.name` in the bundled file, or a custom file via `ORCHESTRATOR_DEPLOYMENT_FILE` — and a model name left unset in both the file and the environment is discovered from the API's model list; the configuration tables below cover the full field list.
+The bundled `deployment/deployment.json` points `model.apiBase` at `http://127.0.0.1:8080/v1`, the PolyStrata (`strata-poly`) server running on the same machine; when the model instead runs elsewhere (a docker network's `llama-server` service, a hosted API), the quickstart overrides the endpoint and model name via these variables. Both can instead be configured in the deployment file — fields `model.apiBase` and `model.name` in the bundled file, or a custom file via `ORCHESTRATOR_DEPLOYMENT_FILE` — and a model name left unset in both the file and the environment is discovered from the API's model list; the configuration tables below cover the full field list.
 
 Open `http://localhost:12345` to give the orchestrator tasks, monitor progress, and respond to questions from the orchestrator.
 

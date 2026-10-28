@@ -166,6 +166,8 @@ export function applyDeploymentOverride(base: DeploymentFileConfig, override: De
 			temperature: override.model?.generation?.temperature ?? base.model.generation.temperature,
 			maxTokens: override.model?.generation?.maxTokens ?? base.model.generation.maxTokens,
 		},
+		...(base.model.pauseCommand !== undefined ? { pauseCommand: base.model.pauseCommand } : {}),
+		...(base.model.startCommand !== undefined ? { startCommand: base.model.startCommand } : {}),
 	}
 	const interruptTriggers = mergeInterruptTriggers(base.executor.interruptTriggers, override.executor?.interruptTriggers)
 	const executor = {

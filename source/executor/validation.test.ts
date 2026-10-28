@@ -257,6 +257,14 @@ describe('validateDeploymentFileConfig throws ValidationError with a path-based 
 		const bad = { ...validDeployment, model: { ...validDeployment.model, reasoningField: 'reasoning' } }
 		expect(() => validateDeploymentFileConfig(bad)).toThrow(/model\.reasoningField.*unknown key "reasoningField"/)
 	})
+	test('accepts a model.pauseCommand argv array and rejects malformed ones', () => {
+		const accepted = { ...validDeployment, model: { ...validDeployment.model, pauseCommand: ['pkill', '-f', 'serve/server.py'] } }
+		expect(() => validateDeploymentFileConfig(accepted)).not.toThrow()
+		for (const badCommand of [[], 'pkill', [''], ['ok', 42]]) {
+			const bad = { ...validDeployment, model: { ...validDeployment.model, pauseCommand: badCommand } }
+			expect(() => validateDeploymentFileConfig(bad)).toThrow(/model\.pauseCommand/)
+		}
+	})
 	test.each([
 		['maxAgentDepth', 'deep'],
 		['defaultToolTimeoutSeconds', 'long'],

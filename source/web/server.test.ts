@@ -460,6 +460,8 @@ interface HandlerHarness {
 	resolveActive: () => (meta: RunMeta) => void
 	resolveResumed: () => (meta: RunMeta) => void
 	resumedCheckpoints: () => RunCheckpoint[]
+	pauseCalls: () => number
+	resumeCalls: () => number
 }
 
 // Builds a fresh handler whose startRun and resumeRun park on caller-controlled resolvers, so each test drives its own run lifecycle without touching shared state. The static leaf is a recording fake; every dependency is in-memory. runIdCollides makes runDirectoryExists report an existing directory for the generated id, exercising the submit-level run_id_collision refusal. build seeds the image build identifier GET /api/config surfaces (null, as from a source checkout, unless a test passes one).
@@ -506,6 +508,8 @@ function createHandlerHarness(options: { runIdCollides?: boolean, build?: BuildI
 	const interruptChannel = createInterruptChannel()
 	const humanBackend = createWebHumanBackend()
 	const staticCalls: string[] = []
+	let pauseCalls = 0
+	let resumeCalls = 0
 	const handler = createRequestHandler(
 		{
 			guildConfig: sampleGuildConfig,
@@ -525,6 +529,13 @@ function createHandlerHarness(options: { runIdCollides?: boolean, build?: BuildI
 			readQueue: queue.readQueue,
 			writeQueue: queue.writeQueue,
 			tickScheduler: () => scheduler.tick(),
+			requestPause: () => {
+				pauseCalls += 1
+			},
+			requestResume: () => {
+				resumeCalls += 1
+			},
+			pauseStatus: () => ({ paused: false, resuming: false, since: null, error: null }),
 			build: options.build ?? null,
 		},
 		async (requestPath) => {
@@ -547,6 +558,8 @@ function createHandlerHarness(options: { runIdCollides?: boolean, build?: BuildI
 		resolveActive: () => resolveActive,
 		resolveResumed: () => resolveResumed,
 		resumedCheckpoints: () => resumed,
+		pauseCalls: () => pauseCalls,
+		resumeCalls: () => resumeCalls,
 	}
 }
 
@@ -1875,6 +1888,29 @@ describe('POST /api/runs', () => {
 
 		resolveActive()(terminalMeta('test-run-1', 'the queued follow-up'))
 		await submission.awaitActive()
+	})
+})
+
+describe('POST /api/pause and /api/resume', () => {
+	test('pause acknowledges and asks the service to freeze', async () => {
+		const harness = createHandlerHarness()
+		const response = await harness.handler(post('/api/pause'))
+		expect(response.status).toBe(202)
+		expect(await response.json()).toEqual({ ok: true })
+		expect(harness.pauseCalls()).toBe(1)
+	})
+	test('resume acknowledges and asks the service to start the model', async () => {
+		const harness = createHandlerHarness()
+		const response = await harness.handler(post('/api/resume'))
+		expect(response.status).toBe(202)
+		expect(await response.json()).toEqual({ ok: true })
+		expect(harness.resumeCalls()).toBe(1)
+	})
+	test('GET reports the paused flag', async () => {
+		const harness = createHandlerHarness()
+		const response = await harness.handler(get('/api/pause'))
+		expect(response.status).toBe(200)
+		expect(await response.json()).toEqual({ paused: false, resuming: false, since: null, error: null })
 	})
 })
 

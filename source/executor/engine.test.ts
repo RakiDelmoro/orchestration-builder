@@ -7,6 +7,7 @@ import { runRole } from './engine.ts'
 import type { EngineDependencies } from './engine-state.ts'
 import { resumeRoleStack } from './resume.ts'
 import { createInterruptQueue } from './interrupts.ts'
+import { createPauseGate } from './pause-gate.ts'
 import type { LlmCallResult, LlmCaller, LlmFetch, LlmFetchRequest, LlmRequest, LlmStreamDelta, LlmStreamResponse } from './llm.ts'
 import { createLlmCaller } from './llm.ts'
 import type { LoadedGuild } from './loader.ts'
@@ -206,6 +207,7 @@ function makeDeps(llm: LlmCaller): { deps: EngineDependencies; events: LogEvent[
 		interruptQueue: createInterruptQueue(),
 		contextPressureTracker,
 		checkpointRecorder: sink.recorder,
+		pauseGate: createPauseGate(),
 		parkTracker,
 		publishDelta: noOpPublishDelta,
 	}

@@ -4,6 +4,7 @@ import type { ContextPolicy, DeploymentConfig, ExecutorConfig, GuildConfig, LogE
 import { isRunCheckpoint, type RunCheckpoint } from './checkpoint.ts'
 import { resumeExecutor, runExecutor, type ExecutorDependencies } from './executor.ts'
 import { createInterruptQueue } from './interrupts.ts'
+import { createPauseGate } from './pause-gate.ts'
 import type { LlmCallResult, LlmCaller } from './llm.ts'
 import type { LoadedGuild } from './loader.ts'
 import type { AppendLog, DeleteCheckpoint, RunDirectory, WriteCheckpoint, WriteMeta } from './persistence.ts'
@@ -159,6 +160,7 @@ function makeDeps(llm: FakeLlm, persistence: FakePersistenceFns, loadedGuild: Lo
 		loadedGuild,
 		interruptQueue: createInterruptQueue(),
 		publishDelta: () => undefined,
+		pauseGate: createPauseGate(),
 	}
 }
 

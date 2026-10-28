@@ -20,6 +20,16 @@ const MAX_LOG_LINES = 200
 const LOG_WINDOW_DEFAULT_LIMIT = 50
 const LOG_WINDOW_MAX_LIMIT = 500
 
+export interface PauseStatus {
+	paused: boolean
+	// True while a resume is starting the model and waiting for its API; the run is still frozen and no tokens flow.
+	resuming: boolean
+	// ISO timestamp of the current paused/resuming state, for an elapsed-time caption; null when neither.
+	since: string | null
+	// The last resume failure (start command could not run, or the model did not answer before the timeout), shown until the next pause/resume.
+	error: string | null
+}
+
 export interface RequestHandlerConfig {
 	guildConfig: GuildConfig
 	deployment: DeploymentConfig
@@ -40,6 +50,12 @@ export interface RequestHandlerConfig {
 	writeQueue: WriteTaskQueue
 	// The scheduler's tick: queue mutations that could find the slot free (enqueue, answer, requeue) and the idle POST /api/runs path dispatch through it, so a free slot never sits idle behind a waiting item.
 	tickScheduler: () => Promise<void>
+	// The service-level pause (POST /api/pause): freeze the run, keep the harness/UI alive and stop the local model. The callback owns the work; the route only acknowledges.
+	requestPause: () => void
+	// Resume (POST /api/resume): start the local model (`model.startCommand`) and open the gate once its API answers.
+	requestResume: () => void
+	// The service's pause/resume state for GET /api/pause and the UI banner (paused, model loading, elapsed, last failure).
+	pauseStatus: () => PauseStatus
 	// The baked image build identifier, read once at startup (null without a baked build-info); surfaced through GET /api/config.
 	build: BuildInfo | null
 }
@@ -394,6 +410,7 @@ export function createRequestHandler(config: RequestHandlerConfig, serveStatic: 
 		const { pathname } = url
 
 		if (request.method === 'GET') {
+			if (pathname === '/api/pause') return json(config.pauseStatus())
 			if (pathname === '/api/config') return json(renderConfig(guildConfig, deployment, config.tools, config.build))
 			if (pathname === '/api/queue') return handleGetQueue(readQueue)
 			if (pathname === '/api/settings') return handleGetSettings(readProjectSettings)
@@ -435,6 +452,15 @@ export function createRequestHandler(config: RequestHandlerConfig, serveStatic: 
 		}
 
 		if (request.method === 'POST') {
+			// The operator's pause and resume: no body. Pause keeps this process and its UI alive; resume acknowledges before the model finishes loading (the UI polls GET /api/pause).
+			if (pathname === '/api/pause') {
+				config.requestPause()
+				return json({ ok: true }, 202)
+			}
+			if (pathname === '/api/resume') {
+				config.requestResume()
+				return json({ ok: true }, 202)
+			}
 			if (pathname === '/api/runs') {
 				const body = await readJsonBody(request)
 				if (body === undefined) return json({ ok: false, error: 'invalid_body' }, 400)

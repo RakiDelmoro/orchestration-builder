@@ -38,6 +38,10 @@ export interface ModelConfig {
 	apiBase: string
 	contextWindow?: number
 	generation: GenerationConfig
+	// The local model server's stop command, run by POST /api/pause (or SIGUSR1): the operator's one action freezes the run, keeps the harness/UI alive and gives the GPU/RAM back. An argv array, never a shell string, so a deployment file cannot smuggle shell syntax. Absent means pause only freezes the run.
+	pauseCommand?: string[]
+	// The command that starts the local model again when POST /api/resume is pressed. Spawned without a shell; resume waits until the model API answers before releasing the run.
+	startCommand?: string[]
 }
 
 // The complete model the executor consumes: every deployment-sourced field is guaranteed present, so a missing value fails at startup instead of surfacing as undefined deep in a run.
@@ -136,6 +140,8 @@ export interface LlmRequest {
 	tools?: ToolManifest[]
 	// Streaming tap for turn text: invoked with each recognized payload-text delta as it arrives, and with a `reset` delta immediately before the first delta of every attempt — the first turn and every retry — because a retried stream re-emits its text from zero and a client accumulation must clear. Optional and additive — a caller that omits it simply streams nowhere.
 	onDelta?: (delta: LlmStreamDelta) => void
+	// The service pause gate's signal: aborting it turns this call into a `paused` outcome (not a retryable failure), so the engine can hold the run at its turn boundary while the model is unloaded.
+	signal?: AbortSignal
 }
 
 // One streamed turn-text delta. `reset` is set only on the synthetic empty-content delta that precedes an attempt's first delta, marking that the client's whole accumulation — reasoning and content, not just the named field — must be cleared before appending.
@@ -164,6 +170,8 @@ export type LlmCallResult =
 	}
 	| { kind: 'context_budget_exceeded'; promptTokens: number; contextWindow: number }
 	| { kind: 'llm_unavailable'; message: string }
+	// The service paused while this turn was in flight: no retry, no error card. The engine waits on the pause gate and re-issues the turn after resume.
+	| { kind: 'paused' }
 
 export type ErrorKind =
 	| 'invalid_tool_call'

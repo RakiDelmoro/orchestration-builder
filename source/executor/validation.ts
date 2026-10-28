@@ -203,7 +203,7 @@ function validateGenerationConfig(value: unknown, path: string): asserts value i
 	ensure(isOptionalNumber, value.maxTokens, `${path}.maxTokens`, 'expected a number or undefined')
 }
 
-const modelKeys: readonly string[] = ['name', 'apiBase', 'contextWindow', 'generation']
+const modelKeys: readonly string[] = ['name', 'apiBase', 'contextWindow', 'generation', 'pauseCommand', 'startCommand']
 
 function validateModelConfig(value: unknown, path: string): asserts value is ModelConfig {
 	if (!isObject(value)) throw new ValidationError(path, 'expected an object')
@@ -213,6 +213,14 @@ function validateModelConfig(value: unknown, path: string): asserts value is Mod
 	if (value.name !== undefined && (typeof value.name !== 'string' || value.name === '')) throw new ValidationError(`${path}.name`, 'expected a non-empty string')
 	ensure(isString, value.apiBase, `${path}.apiBase`, 'expected a string')
 	if (value.contextWindow !== undefined && (!isNumber(value.contextWindow) || value.contextWindow <= 0)) throw new ValidationError(`${path}.contextWindow`, 'expected a positive number')
+	for (const field of ['pauseCommand', 'startCommand'] as const) {
+		const command = value[field]
+		if (command === undefined) continue
+		if (!Array.isArray(command) || command.length === 0) throw new ValidationError(`${path}.${field}`, 'expected a non-empty array of strings')
+		for (const [index, argument] of command.entries()) {
+			if (typeof argument !== 'string' || argument === '') throw new ValidationError(`${path}.${field}[${index}]`, 'expected a non-empty string')
+		}
+	}
 	validateGenerationConfig(value.generation, `${path}.generation`)
 }
 

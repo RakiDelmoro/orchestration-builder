@@ -107,7 +107,7 @@ function llmCallPayload(roleName: string, roleId: string, sentMessages: Message[
 }
 
 function handleLlmResult(
-	llmResult: LlmCallResult,
+	llmResult: Exclude<LlmCallResult, { kind: 'paused' }>,
 	roleState: RoleState,
 	deps: EngineDependencies,
 	context: EngineContext,
@@ -448,6 +448,8 @@ async function executeRoleLoop(
 
 		// The safe point: no LLM call is in flight and every queued platform mutation (drain, compaction, pressure notice) has been applied, so the checkpoint written here is the state a restart resumes from. Only the active leaf reaches this — suspended ancestors are captured through their registered frames.
 		deps.checkpointRecorder.write()
+		// A closed gate holds the run here, after its checkpoint, until the operator resumes: the harness stays alive and the in-memory stack is preserved; no model request is issued meanwhile.
+		await deps.pauseGate.waitWhilePaused()
 
 		const globalError = checkGlobalBudgets(context.depth, config)
 		if (globalError !== null) {
@@ -474,7 +476,11 @@ async function executeRoleLoop(
 			messages,
 			tools: allowedToolsManifests,
 			onDelta: (delta) => deps.publishDelta({ roleId: registryEntry.roleId, role: context.roleName, ...delta }),
+			signal: deps.pauseGate.signal(),
 		})
+
+		// A paused turn produced no assistant message; the loop top holds on the gate and re-issues the same request after resume.
+		if (llmResult.kind === 'paused') continue
 
 		const handling = handleLlmResult(llmResult, roleState, deps, context)
 		// llm_call is emitted after handleLlmResult so the received assistant response, finishReason, and per-call usage all land in one event. It is emitted only on the success paths (continue/tool_calls and success-finished): the llm_unavailable and context_budget_exceeded paths log their own dedicated events inside handleLlmResult and must not also emit a misleading llm_call.

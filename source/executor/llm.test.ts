@@ -666,3 +666,36 @@ describe('createLlmCaller stall timeouts', () => {
 		})
 	})
 })
+
+describe('pause signal', () => {
+	test('aborting the pause signal returns paused without retrying or reporting a failure', async () => {
+		let cancelled = false
+		const stream = new ReadableStream<Uint8Array>({
+			start() {},
+			cancel() {
+				cancelled = true
+			},
+		})
+		const wire = createFakeWire([{ kind: 'stream', status: 200, stream }])
+		// A scheduler that never fires: the point is the pause abort, not the idle bound.
+		const scheduleTimeout: ScheduleTimeout = () => () => {}
+		const caller = createLlmCaller(MODEL, API_KEY, { llmFetch: wire.llmFetch, sleep: wire.sleep, scheduleTimeout })
+		const controller = new AbortController()
+		const pending = caller.call({ messages: [{ role: 'user', content: 'hi' }], signal: controller.signal })
+		await Promise.resolve()
+		controller.abort()
+		expect(await pending).toEqual({ kind: 'paused' })
+		expect(wire.requests).toHaveLength(1)
+		expect(wire.sleeps).toEqual([])
+		expect(cancelled).toBe(true)
+	})
+
+	test('an already-aborted signal never sends a request', async () => {
+		const wire = createFakeWire([])
+		const caller = createLlmCaller(MODEL, API_KEY, { llmFetch: wire.llmFetch, sleep: wire.sleep, scheduleTimeout: wire.scheduleTimeout })
+		const controller = new AbortController()
+		controller.abort()
+		expect(await caller.call({ messages: [{ role: 'user', content: 'hi' }], signal: controller.signal })).toEqual({ kind: 'paused' })
+		expect(wire.requests).toHaveLength(0)
+	})
+})

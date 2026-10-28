@@ -113,6 +113,8 @@ The interrupt platform lets the Guild define agents that interrupt running work 
 
 **Graceful shutdown.** On `SIGINT`/`SIGTERM` with an active run, the service submits a wind-down `notice` through the same queue — the internal interrupt kind that injects a marked user message into the chain root's history (a directive to wind down, not a question to answer) — and waits under a bounded timeout (`30s`) before exiting, so a run can finish at a safe point instead of being abandoned mid-turn. A run still active when the timeout elapses is not lost: the next startup resumes it from its last checkpoint (see "Run persistence and resumption").
 
+**Pausing on purpose.** `POST /api/pause` (or `SIGUSR1`) freezes the run and stops the local model without stopping the service: the in-flight model call is aborted as a `paused` outcome, the engine holds the turn loop at its next boundary after the checkpoint, and `model.pauseCommand` stops the model server so its GPU memory is freed. The harness, its UI and the in-memory role stack stay alive; the run's meta stays `running` and `GET /api/pause` reports `{ "paused": true, "resuming": false, "since": "...", "error": null }`. `POST /api/resume` starts the model with `model.startCommand`, waits for its API, then opens the gate and the engine re-issues the interrupted turn; while it loads, `GET /api/pause` reports `resuming: true` and the UI shows a "loading the model" banner instead of a working-looking run. The topbar button toggles the two. If the harness starts while the model API is unreachable, it boots paused (the failed probe closes the gate) so a resumed run is not spent on failed calls; Resume starts the model. If the harness is stopped while a run is paused, the next start resumes it from its checkpoint as usual.
+
 ### Run persistence and resumption
 
 The executor keeps every role's conversation and budget state in memory, so a service restart (crash, host reboot, `docker stop`, operator Ctrl-C) would otherwise lose the active run. To survive it, the executor checkpoints the runnable role stack to `<run>/state.json`, and the service reconciles runs on startup.
@@ -330,7 +332,9 @@ The constraints mirror the file's semantics with the error pointing at the varia
   "name": "qwen2.5-coder:32b",
   "apiBase": "http://localhost:11434/v1",
   "contextWindow": 32768,
-  "generation": { "temperature": 0.2, "maxTokens": 4096 }
+  "generation": { "temperature": 0.2, "maxTokens": 4096 },
+  "pauseCommand": ["pkill", "-9", "-f", "serve/server.py|strata-poly"],
+  "startCommand": ["python", "serve/server.py", "--port", "8081"]
 }
 ```
 
@@ -338,6 +342,8 @@ The constraints mirror the file's semantics with the error pointing at the varia
 - `apiBase`: OpenAI-compatible Responses API base URL; the executor posts to `{apiBase}/responses`.
 - `contextWindow` (optional): context window size in tokens. Set it here or via `ORCHESTRATOR_MODEL_CONTEXT_WINDOW`; an API-reported value (llama.cpp's `meta.n_ctx`, or a rich catalog entry's top-level `context_length`) always wins over the configured one, and a value the API also does not report fails startup.
 - `generation`: default sampling parameters (`temperature`, `maxTokens`) applied to every role. There is no per-role generation override. `maxTokens` maps to the Responses API's `max_output_tokens`, which includes reasoning tokens, so the value must leave room for the visible answer.
+- `pauseCommand` (optional): an argv array naming how to stop the local model server when the harness pauses (`POST /api/pause` or `SIGUSR1`). It runs without a shell, is killed after 10s, and its failure is logged without blocking the pause. The service and its UI stay up; the active run freezes at its next turn boundary. A server that defers SIGTERM while a request is in flight (PolyStrata does) needs `-9`, and the pattern must cover the engine child too, as in the example: a hard-killed supervisor otherwise leaves the engine holding the GPU. Omit it for a remote model.
+- `startCommand` (optional): an argv array that starts the local model again on `POST /api/resume` (the UI's Resume button). It is spawned without a shell, as a child of the harness; resume polls `{apiBase}/models` until it answers (up to 15 minutes) and only then re-enters the run. Omit it when the operator starts the model themselves.
 
 ### `executor`
 
@@ -389,6 +395,12 @@ The browser tab title of the served UI is a service setting, not a deployment fi
 Starts a run. **Body:** `{ "task": "...", "effort"?: "quick"|"standard"|"thorough", "logLevel"?: "full"|"standard", "continuesFrom"?: "<run_id>" }`. `effort` is optional; the validated tier is recorded on the enqueued item and applies to its run as the per-run effort override, and when omitted the project default (see `GET|PUT /api/settings`) is applied, falling back to `"standard"` when no default is set. Anything but the three tier strings returns `400 invalid_body`. `logLevel` is optional and picks the run's logging level (see "Logging level"); when omitted it resolves through the same chain — project default, then the deployment file's `logging.level`, then `"full"` — and anything but the two level strings returns `400 invalid_body`. `continuesFrom` starts a new run that continues a prior one; when present it must be a well-formed run id (`run-YYYYMMDD-HHMMSS`) naming a known run whose status is terminal (`success`, `error`, `needs_clarification`, or `interrupted` — a `running` run has no outcome to continue from), and anything else returns `400 invalid_body`. A continuation run records the lineage as `continuesFrom` in its `meta.json` (see "Persistence"), and the executor injects a clearly-marked briefing block into the entry role's initial user message — below the operator's new task text, quoting the prior run's task, its result summary, and the `read_plan` handle for the prior run's plan document — so the Guild can pick up where the prior run left off (the planner reads the prior plan with `read_plan(runId)`); the executor provides the channel only, and the Guild decides what to do with the continuation. **201:** `{ "runId": "..." }`. **409:** `{ "ok": false, "error": "run_in_progress" }` when a run is already active, or `{ "ok": false, "error": "run_id_collision" }` when the generated run id collides with an existing run directory — run ids have one-second resolution, so a prior run that failed instantly can still own the fresh id, and sharing a directory would interleave the two runs' logs and metas; resubmitting generates a new id.
 
 Internally the validated task is enqueued at the head of the durable task queue (recording the request's `effort`, `logLevel`, and `continuesFrom` on the item) and the queue's scheduler dispatches it within the same request when the run slot is free — the response still carries the started run's id, and every active run is queue-tracked. The busy-service 409 is decided before anything is enqueued.
+
+### `POST /api/pause`, `POST /api/resume`, `GET /api/pause`
+
+Pause freezes the active run and stops the local model while the service and its UI stay alive. No body. **202:** `{ "ok": true }`. The in-flight model call is aborted (a `paused` outcome, not a retry or an error), the turn's checkpoint stays on disk and the in-memory role stack is held at the next turn boundary; `model.pauseCommand` then stops the model server, freeing its GPU/RAM. The run's meta stays `running`; `GET /api/pause` reports `{ "paused": true }` and the UI swaps its Pause button for Resume.
+
+Resume starts the model again via `model.startCommand` and opens the gate once `{apiBase}/models` answers; **202:** `{ "ok": true }` immediately, because a local model can take minutes to load (the UI polls `GET /api/pause` until it flips). The engine then re-issues the interrupted turn from its checkpoint. With no `startCommand` configured, resume opens the gate at once and the operator is responsible for starting the model. `SIGUSR1` toggles pause/resume from a terminal. Pausing twice, or resuming while a start is in flight, is a no-op.
 
 ### `/api/queue`
 

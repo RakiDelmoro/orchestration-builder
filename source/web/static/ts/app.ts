@@ -225,6 +225,12 @@ export interface ApplicationState {
 	draggingItemId: string | null
 	queueAnswerPendingId: string | null
 	serverAvailable: boolean
+	// True while the operator has paused the service (GET /api/pause): the run is frozen and the local model is stopped, but this page and the harness keep running.
+	paused: boolean
+	// True while Resume is loading the model; the run is still frozen and no tokens flow, so the UI must not look like it is working.
+	resuming: boolean
+	pauseSince: string | null
+	pauseError: string | null
 	justSubmittedRunId: string | null
 	muted: boolean
 	shownQuestionIds: Record<string, boolean>
@@ -587,6 +593,7 @@ function Tick(state: ApplicationState): ActionReturn {
 		Fetch({ url: 'api/runs', ok: GotRunList, fail: FetchFailed }),
 		Fetch({ url: 'api/questions', ok: GotQuestions, fail: FetchFailed }),
 		Fetch({ url: 'api/queue', ok: GotQueue, fail: FetchFailed }),
+		Fetch({ url: 'api/pause', ok: GotPauseState, fail: FetchFailed }),
 	]
 }
 
@@ -1789,14 +1796,18 @@ function StatusPills(state: ApplicationState): Vnode[] {
 	if (!state.serverAvailable) {
 		return [h('span', { class: 'status-pill status-pill-warn' }, SERVER_UNAVAILABLE_MESSAGE)]
 	}
+	// The run's own status says "running" while it is paused or its model loads (the run is alive and resumable), so this pill carries the operator-facing truth the stage cannot: the model is stopped, or loading.
+	const pausePills = state.paused
+		? [h('span', { class: state.resuming ? 'status-pill status-pill-warn' : 'status-pill status-pill-paused' }, state.resuming ? 'loading model…' : 'paused')]
+		: []
 	if (state.selectedRunId === null) {
 		if (activeRunId !== null) {
-			return [h('span', { class: 'status-pill status-pill-live status-pill-clickable', onclick: [SelectRun, activeRunId] }, 'a run is in progress — view')]
+			return [...pausePills, h('span', { class: 'status-pill status-pill-live status-pill-clickable', onclick: [SelectRun, activeRunId] }, 'a run is in progress — view')]
 		}
 		const message = state.summaries.length === 0 ? 'idle' : 'no run selected'
-		return [h('span', { class: 'status-pill' }, message)]
+		return [...pausePills, h('span', { class: 'status-pill' }, message)]
 	}
-	const pills = [h('span', { class: `status-pill status-pill-${state.selectedRunStatus ?? 'unknown'}` }, statusLabel(state.selectedRunStatus))]
+	const pills = [...pausePills, h('span', { class: `status-pill status-pill-${state.selectedRunStatus ?? 'unknown'}` }, statusLabel(state.selectedRunStatus))]
 	if (activeRunId !== null && activeRunId !== state.selectedRunId) {
 		pills.push(h('span', { class: 'status-pill status-pill-live status-pill-clickable', onclick: [SelectRun, activeRunId] }, 'a run is in progress — view'))
 	}
@@ -1824,6 +1835,57 @@ function BuildLabel(build: BuildInfo | null): Vnode | null {
 	return h('span', { class: 'topbar-build', title: `Built ${build.builtAt}` }, label)
 }
 
+function GotPauseState(state: ApplicationState, payload: FetchResultPayload): ApplicationState {
+	if (!payload.ok || !isObject(payload.body)) return state
+	const { paused, resuming, since, error } = payload.body
+	if (typeof paused !== 'boolean' || typeof resuming !== 'boolean') return state
+	return {
+		...state,
+		paused,
+		resuming,
+		pauseSince: typeof since === 'string' ? since : null,
+		pauseError: typeof error === 'string' ? error : null,
+	}
+}
+
+// The operator's pause/resume: pause freezes the run and stops the local model while this page stays up; resume starts the model and the run continues from its checkpoint. A confirmation guards the pause because a stray click costs a model reload.
+function TogglePause(state: ApplicationState): ActionReturn {
+	if (state.resuming) return state
+	if (state.paused) {
+		return [state, Fetch({ url: 'api/resume', init: { method: 'POST' }, ok: (current: ApplicationState) => current, fail: (current: ApplicationState) => current })]
+	}
+	if (!window.confirm('Pause the run and stop the local model? The harness stays up; press Resume to continue.')) return state
+	return [state, Fetch({ url: 'api/pause', init: { method: 'POST' }, ok: (current: ApplicationState) => current, fail: (current: ApplicationState) => current })]
+}
+
+function formatPauseElapsed(state: ApplicationState): string {
+	if (state.pauseSince === null) return ''
+	const started = Date.parse(state.pauseSince)
+	if (Number.isNaN(started)) return ''
+	const seconds = Math.max(0, Math.round((state.now - started) / 1000))
+	const minutes = Math.floor(seconds / 60)
+	return minutes === 0 ? `${seconds}s` : `${minutes}m ${seconds % 60}s`
+}
+
+// The banner that keeps a paused or resuming harness from looking like a working one: the run view still says "running" because the run is alive and resumable, but no model call or token flow happens until Resume finishes loading the model.
+function PauseBanner(state: ApplicationState): Vnode | null {
+	if (!state.paused) return null
+	const elapsed = formatPauseElapsed(state)
+	const errorLine = state.pauseError === null ? null : h('span', { class: 'pause-banner-error' }, state.pauseError)
+	if (state.resuming) {
+		return h('div', { class: 'pause-banner is-resuming', role: 'status' }, [
+			h('strong', {}, 'Resuming — loading the local model'),
+			h('span', {}, ` The run is frozen and no tokens are being generated${elapsed === '' ? '' : ` (${elapsed})`}. It continues automatically once the model answers; no second click is needed.`),
+			errorLine,
+		])
+	}
+	return h('div', { class: 'pause-banner', role: 'status' }, [
+		h('strong', {}, 'Paused — model stopped'),
+		h('span', {}, ` The run is frozen at its last checkpoint and the GPU is free${elapsed === '' ? '' : ` (paused ${elapsed})`}. Press Resume to load the local model and continue exactly where it stopped.`),
+		errorLine,
+	])
+}
+
 function TopBar(state: ApplicationState): Vnode {
 	return h('header', { class: 'topbar' }, [
 		h('span', { class: 'topbar-wordmark' }, 'Adaptive Orchestrator'),
@@ -1834,6 +1896,7 @@ function TopBar(state: ApplicationState): Vnode {
 			h('button', { type: 'button', class: { 'nav-button': true, 'is-active': state.screen === 'compose' }, title: 'Add a task to the queue', onclick: [SetScreen, 'compose'] }, 'Add task'),
 			h('button', { type: 'button', class: { 'nav-button': true, 'is-active': state.screen === 'queue' }, title: 'Manage the task queue', onclick: [SetScreen, 'queue'] }, `Queue (${backlogCount(state.queueItems)})`),
 			h('button', { type: 'button', class: { 'nav-button': true, 'is-active': state.screen === 'history' }, title: 'Browse past runs', onclick: [SetScreen, 'history'] }, `History (${state.summaries.length})`),
+			h('button', { type: 'button', class: 'nav-button', disabled: state.resuming, title: state.resuming ? 'The local model is loading; the run continues automatically when it is ready' : state.paused ? 'Start the local model and continue the run' : 'Freeze the run and stop the local model; this page stays up', onclick: TogglePause }, state.resuming ? 'Loading model…' : state.paused ? 'Resume' : 'Pause'),
 			h('label', { class: 'mute-toggle', title: 'Mute the alert sound for incoming questions' }, [
 				h('input', { type: 'checkbox', checked: state.muted, onchange: ToggleMute }),
 				'mute',
@@ -2417,7 +2480,8 @@ function Main(state: ApplicationState): Vnode {
 }
 
 function view(state: ApplicationState): Vnode {
-	return h('div', { class: 'app-shell' }, [TopBar(state), Main(state)])
+	const banner = PauseBanner(state)
+	return h('div', { class: 'app-shell' }, [TopBar(state), ...(banner === null ? [] : [banner]), Main(state)])
 }
 
 // --- App -------------------------------------------------------------------
@@ -2429,7 +2493,7 @@ function isApplicationState(value: unknown): value is ApplicationState {
 	const stateKeys: (keyof ApplicationState)[] = [
 		'summaries', 'selectedRunId', 'selectedRunView', 'selectedRunStatus', 'pendingQuestions',
 		'queueItems', 'justSubmittedItemId', 'pendingAddSelectionId', 'editingItemId', 'draggingItemId', 'queueAnswerPendingId',
-		'serverAvailable', 'justSubmittedRunId', 'muted', 'shownQuestionIds', 'firstQuestionsPoll', 'pendingAnswerId',
+		'serverAvailable', 'justSubmittedRunId', 'muted', 'shownQuestionIds', 'firstQuestionsPoll', 'pendingAnswerId', 'paused', 'resuming', 'pauseSince', 'pauseError',
 		'runEffort', 'savingEffort', 'runLogLevel', 'savingLogLevel',
 		'flowModel', 'previousFlowModel', 'labelResolver', 'guildParticipants', 'build',
 		'flowTier', 'flowViewMode', 'sequenceRolesOnly', 'screen', 'historyExpanded', 'continuation',
@@ -2462,6 +2526,10 @@ app({
 			draggingItemId: null,
 			queueAnswerPendingId: null,
 			serverAvailable: true,
+			paused: false,
+			resuming: false,
+			pauseSince: null,
+			pauseError: null,
 			justSubmittedRunId: null,
 			muted: false,
 			shownQuestionIds: {},

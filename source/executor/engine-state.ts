@@ -4,6 +4,7 @@ import type { HumanBackend } from './human-backend.js'
 import type { InterruptQueue } from './interrupts.js'
 import type { LoadedGuild } from './loader.js'
 import type { LlmCaller } from './llm.js'
+import type { PauseGate } from './pause-gate.js'
 import type { AppendLog } from './persistence.js'
 import type { RunParkTracker } from './park-state.js'
 import type { RecentToolCall } from './role-inspection.js'
@@ -66,6 +67,8 @@ export interface EngineDependencies {
 	parkTracker: RunParkTracker
 	// The run-scoped delta publisher: a leaf bound to the active run by the service (serve.ts's withRunBindings), so every streamed turn text carries the run's identity.
 	publishDelta: (delta: RoleDelta) => void
+	// The service pause gate: a closed gate aborts the in-flight model request and holds the turn loop at its top until resumed.
+	pauseGate: PauseGate
 }
 
 // The turn a resumed role was suspended in: the full tool-call list, the index of the agent call it was waiting on, and a resolver for the child card. The resolver either returns the checkpoint's recorded card or re-enters the child frame's own resume — invoked from inside the parent's suspended turn so parents register root-first exactly as in live execution.

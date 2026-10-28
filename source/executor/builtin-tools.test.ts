@@ -5,6 +5,7 @@ import type { EngineDependencies } from './engine-state.ts'
 import { createContextPressureTracker } from './context-pressure.ts'
 import type { HumanBackend } from './human-backend.ts'
 import { createInterruptQueue } from './interrupts.ts'
+import { createPauseGate } from './pause-gate.ts'
 import type { LlmCallResult, LlmCaller } from './llm.ts'
 import type { LoadedGuild } from './loader.ts'
 import type { AppendLog } from './persistence.ts'
@@ -202,6 +203,7 @@ function makeDeps(llm: FakeLlm, humanBackend: HumanBackend): { deps: EngineDepen
 		interruptQueue: createInterruptQueue(),
 		contextPressureTracker,
 		checkpointRecorder: sink.recorder,
+		pauseGate: createPauseGate(),
 		parkTracker,
 		publishDelta: () => undefined,
 	}

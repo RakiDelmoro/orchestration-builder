@@ -1,12 +1,14 @@
 {
 	"model": {
-		"name": "Qwen 3.8 27b",
-		"apiBase": "http://llama-server/v1",
-		"contextWindow": 262144,
+		"name": "flint-40b-a2.5b-ud-q4_k_xl",
+		"apiBase": "http://127.0.0.1:8081/v1",
+		"contextWindow": 131072,
 		"generation": {
 			"temperature": 1.0,
-			"maxTokens": 65536
-		}
+			"maxTokens": 32768
+		},
+		"pauseCommand": ["pkill", "-9", "-f", "serve/server.py|strata-poly"],
+		"startCommand": ["/workspaces/PolyStrata/.venv/bin/python", "/workspaces/PolyStrata/serve/server.py", "--engine", "strata", "--config", "/workspaces/PolyStrata/strata-flint-ud-q4_k_xl.json", "--port", "8081"]
 	},
 
 	"executor": {

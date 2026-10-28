@@ -1,10 +1,11 @@
 
 import * as path from 'node:path'
 
-import { createWebServer } from './web/server.js'
+import { createWebServer, type WebServer } from './web/server.js'
 import { createBootstrapFailureHandler } from './web/bootstrap-failure.js'
 import { createBuildInfoReader } from './web/build-info.js'
 import { createSnapshotCache } from './web/snapshot-cache.js'
+import { createPauseGate, type PauseGate } from './executor/pause-gate.js'
 import { createRunListCache } from './web/run-list-cache.js'
 import { createStreamHub } from './web/stream-hub.js'
 import { createTaskSummarizer, type TaskSummarizer } from './summarize.js'
@@ -67,6 +68,7 @@ async function withRunBindings<T>(config: {
 	guildPath: string
 	workspaceRootPath: string
 	runsBaseDir: string
+	pauseGate: PauseGate
 }, runId: string, logLevel: LogLevel, invoke: (dependencies: ExecutorDependencies) => Promise<T>): Promise<T> {
 	const additionalToolHandlers = {
 		...createToolHandlers({
@@ -101,6 +103,7 @@ async function withRunBindings<T>(config: {
 		humanBackend: config.humanBackend,
 		interruptQueue,
 		publishDelta: (delta) => config.deltaChannel.publish(delta),
+		pauseGate: config.pauseGate,
 	}
 	try {
 		return await invoke(dependencies)
@@ -131,6 +134,7 @@ interface RunServiceConfig {
 	guildPath: string
 	workspaceRootPath: string
 	runsBaseDir: string
+	pauseGate: PauseGate
 }
 
 function createStartRun(config: RunServiceConfig): StartRun {
@@ -219,6 +223,14 @@ async function serve(): Promise<void> {
 	let guild: LoadedGuild
 	let apiKey: string | undefined
 	let kagiApiKey: string | undefined
+	// The deployment's model lifecycle commands (docs/reference.md "Deployment configuration"): pause stops the model, resume starts it again, while this process and its UI stay up.
+	let pauseCommand: string[] | undefined
+	let startCommand: string[] | undefined
+	let modelApiBase: string | undefined
+	// One run at a time, so one pause gate: requestPause closes it (aborting the in-flight model call), resume opens it after the model is back. Created before the startup probe because an unreachable model at boot starts the service paused instead of resuming a run into failed calls.
+	const pauseGate = createPauseGate()
+	let pauseSince: string | undefined
+	let resumeError: string | undefined
 	// The deployment file's logging default (docs/reference.md "Logging level"), captured at startup and handed to the run submission as the chain's lowest-priority input.
 	let deploymentLogLevel: LogLevel | undefined
 	try {
@@ -232,6 +244,9 @@ async function serve(): Promise<void> {
 		validateDeploymentFileConfig(mergedDeployment)
 		validateDeploymentRoleReferences(mergedDeployment, roleNames)
 		deploymentLogLevel = mergedDeployment.logging?.level
+		pauseCommand = mergedDeployment.model.pauseCommand
+		startCommand = mergedDeployment.model.startCommand
+		modelApiBase = mergedDeployment.model.apiBase
 
 		// The orchestrator credential comes from the shared secret channels: the ORCHESTRATOR_API_KEY environment variable first, then a docker secret mounted at /run/secrets/orchestrator_api_key (or ORCHESTRATOR_API_KEY).
 		// resolveSecret trims and normalizes empty values to undefined so the caller omits the Authorization header entirely.
@@ -251,6 +266,10 @@ async function serve(): Promise<void> {
 		const failureReason = probe.ok ? undefined : probe.reason
 		if (!probe.ok) {
 			console.log(`Model API probe failed (${probe.reason}); continuing with the configured model values`)
+			// A resumed run must not spend its retries against a model that is not up: start the service paused so the UI offers Resume (which can start the model) instead of looking like it is working.
+			pauseGate.requestPause()
+			pauseSince = new Date().toISOString()
+			resumeError = `The model API at ${apiBase} did not answer at startup (${probe.reason}). Press Resume once it is running.`
 		}
 		const apiProbe: ModelApiProbe = { apiBase, models, failureReason }
 		const resolution = resolveDeploymentConfig(mergedDeployment, apiProbe)
@@ -309,6 +328,7 @@ async function serve(): Promise<void> {
 		guildPath: GUILD_PATH,
 		workspaceRootPath,
 		runsBaseDir,
+		pauseGate,
 	}
 	const startRun = createStartRun(runConfig)
 	const resumeRun = createResumeRun(runConfig)
@@ -352,7 +372,93 @@ async function serve(): Promise<void> {
 	// Boot order (docs/queueing.md "Dispatch and the scheduler"): reconciliation first, then exactly one scheduler tick. The tick repairs stale active items from their metas and dispatches the head waiting item — unless the resumed run holds the slot, in which case the dispatch restores the head and the resumed run's own settlement ticks onward.
 	await scheduler.tick()
 
-	const webServer = createWebServer({
+	// The pause/resume pair behind POST /api/pause, POST /api/resume and SIGUSR1. Pause freezes the run at its turn boundary (the gate aborts the in-flight request and holds the loop after the checkpoint), stops the model via pauseCommand, and leaves this process, its UI and the in-memory stack alive. Resume starts the model via startCommand, waits for its API, then opens the gate so the engine re-issues the turn.
+	let webServer: WebServer | undefined
+	let resuming = false
+	const PAUSE_COMMAND_TIMEOUT_MS = 10_000
+	const MODEL_START_TIMEOUT_MS = 900_000
+	// Runs one argv command (never a shell) with a bound; a failure is logged but never blocks the operator's pause/resume.
+	async function runLifecycleCommand(command: string[], label: string): Promise<boolean> {
+		try {
+			const child = Bun.spawn(command, { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' })
+			const timer = setTimeout(() => child.kill(), PAUSE_COMMAND_TIMEOUT_MS)
+			const exitCode = await child.exited
+			clearTimeout(timer)
+			if (exitCode === 0) return true
+			const stderr = (await new Response(child.stderr).text()).trim()
+			console.error(`${label} exited ${exitCode}${stderr === '' ? '' : `: ${stderr}`}`)
+			return false
+		} catch (error) {
+			console.error(`${label} could not run: ${error instanceof Error ? error.message : String(error)}`)
+			return false
+		}
+	}
+
+	async function modelApiReachable(): Promise<boolean> {
+		if (modelApiBase === undefined) return false
+		try {
+			const headers: Record<string, string> = {}
+			if (apiKey !== undefined && apiKey !== '') headers['Authorization'] = `Bearer ${apiKey}`
+			const response = await fetch(`${modelApiBase}/models`, { headers, signal: AbortSignal.timeout(3_000) })
+			return response.ok
+		} catch {
+			return false
+		}
+	}
+
+	// Resume is asynchronous: the route acknowledges immediately, the UI keeps showing paused while the model loads (the pause command freed the GPU, so a reload takes minutes), and the gate opens only once the API answers.
+	async function startModelThenResume(): Promise<void> {
+		if (resuming || !pauseGate.paused()) return
+		resuming = true
+		resumeError = undefined
+		try {
+			if (startCommand !== undefined) {
+				try {
+					Bun.spawn(startCommand, { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+				} catch (error) {
+					resumeError = `Start command could not run: ${error instanceof Error ? error.message : String(error)}`
+					console.error(resumeError)
+					return
+				}
+				console.log('Starting the model server; the run resumes when it answers')
+				const sleep = createSleep()
+				const deadline = Date.now() + MODEL_START_TIMEOUT_MS
+				while (Date.now() < deadline && !(await modelApiReachable())) await sleep(2_000)
+				if (!(await modelApiReachable())) {
+					resumeError = 'The model did not answer before the resume timeout; the run stays paused'
+					console.error(resumeError)
+					return
+				}
+			}
+			pauseSince = undefined
+			resumeError = undefined
+			pauseGate.resume()
+			console.log('Model ready; resuming the run')
+		} finally {
+			resuming = false
+		}
+	}
+
+	function requestPause(): void {
+		if (pauseGate.paused()) return
+		pauseGate.requestPause()
+		pauseSince = new Date().toISOString()
+		resumeError = undefined
+		const activeRunId = runSubmission.activeRunId()
+		console.log((activeRunId === undefined ? 'Pausing' : `Pausing run ${activeRunId}`) + (pauseCommand === undefined ? '' : '; stopping the model server'))
+		if (pauseCommand !== undefined) void runLifecycleCommand(pauseCommand, 'Pause command')
+	}
+
+	function requestResume(): void {
+		void startModelThenResume()
+	}
+	// SIGUSR1 is the terminal toggle: pause while running, resume while paused.
+	process.on('SIGUSR1', () => {
+		if (pauseGate.paused()) requestResume()
+		else requestPause()
+	})
+
+	webServer = createWebServer({
 		port,
 		pageTitle,
 		streamHub,
@@ -373,6 +479,14 @@ async function serve(): Promise<void> {
 		readQueue,
 		writeQueue,
 		tickScheduler: () => scheduler.tick(),
+		requestPause,
+		requestResume,
+		pauseStatus: () => ({
+			paused: pauseGate.paused(),
+			resuming,
+			since: pauseSince ?? null,
+			error: resumeError ?? null,
+		}),
 		build: buildInfo,
 	})
 	console.log(`Web UI ready: http://localhost:${webServer.port}`)

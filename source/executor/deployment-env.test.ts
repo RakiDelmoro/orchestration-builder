@@ -195,6 +195,13 @@ describe('applyDeploymentOverride', () => {
 		validateDeploymentFileConfig(merged)
 	})
 
+	test('preserves the model pauseCommand through an override', () => {
+		const base = makeBase()
+		base.model.pauseCommand = ['pkill', '-f', 'serve/server.py']
+		const merged = applyDeploymentOverride(base, resolveDeploymentOverride({ ORCHESTRATOR_MODEL: 'override-model' }))
+		expect(merged.model.pauseCommand).toEqual(['pkill', '-f', 'serve/server.py'])
+	})
+
 	test('does not mutate the base deployment', () => {
 		const base = makeBase()
 		const snapshot = structuredClone(base)

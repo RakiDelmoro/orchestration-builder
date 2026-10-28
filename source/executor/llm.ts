@@ -210,11 +210,16 @@ function readWithIdleTimeout(reader: ReadableStreamDefaultReader<Uint8Array>, id
 }
 
 // Folds one 2xx SSE stream to its mapped call result. Reading stops at the first terminal marker — the [DONE] sentinel or an accumulated terminal event — and the reader is cancelled so the underlying connection is released without draining the tail. Each read is raced against an idle timeout that resets on every delivered chunk, so a stalled stream is cut without an overall deadline on a slow-but-flowing one. An idle timeout is returned as the stream_idle_timeout outcome for the caller's retry loop; every other stream-phase failure (a rejected read, an over-cap line) maps to llm_unavailable instead of escaping: a throw out of here would reach run submission's fatal path and kill the run. The optional onDelta fires after accumulator.apply for each recognized payload-text delta, in stream order.
-async function consumeResponsesStream(stream: ReadableStream<Uint8Array>, options: { idleTimeoutMs: number; scheduleTimeout: ScheduleTimeout; onDelta?: (delta: { field: 'reasoning' | 'content'; text: string }) => void }): Promise<LlmCallResult | StreamIdleTimeout> {
+async function consumeResponsesStream(stream: ReadableStream<Uint8Array>, options: { idleTimeoutMs: number; scheduleTimeout: ScheduleTimeout; onDelta?: (delta: { field: 'reasoning' | 'content'; text: string }) => void; signal?: AbortSignal }): Promise<LlmCallResult | StreamIdleTimeout> {
 	const decoder = new TextDecoder()
 	const assembler = createSseLineAssembler()
 	const accumulator = createResponsesStreamAccumulator()
 	const reader = stream.getReader()
+	// A pause aborts the reader, which ends the pending read as done; the flag is checked after the loop so the outcome is `paused`, never a truncated success or a transport failure.
+	const cancelOnAbort = (): void => {
+		void reader.cancel().catch(() => undefined)
+	}
+	options.signal?.addEventListener('abort', cancelOnAbort, { once: true })
 
 	function applyPayload(payload: SseDataPayload): boolean {
 		if (payload.kind === 'skip') return false
@@ -253,14 +258,18 @@ async function consumeResponsesStream(stream: ReadableStream<Uint8Array>, option
 			for (const line of assembler.finish()) applyPayload(parseSseDataPayload(line))
 		}
 	} catch (error) {
+		// A pause abort cancels the reader above; a rejection it produces is not a transport collapse.
+		if (options.signal?.aborted === true) return { kind: 'paused' }
 		// The idle timeout is a liveness failure the caller retries, not a stream collapse, so it is surfaced as its own outcome rather than folded into an llm_unavailable result.
 		if (error instanceof LlmStreamIdleTimeoutError) return { kind: 'stream_idle_timeout', message: error.message }
 		return { kind: 'llm_unavailable', message: streamCrashMessage(error, accumulator.snapshot()) }
 	} finally {
+		options.signal?.removeEventListener('abort', cancelOnAbort)
 		// Cancel on every exit path so the connection is released. Cancel is called on a body that may have failed mid-write, so its own rejection is swallowed here to keep it from replacing (and masking) the mapped result.
 		await reader.cancel().catch(() => undefined)
 	}
 
+	if (options.signal?.aborted === true) return { kind: 'paused' }
 	const snapshot = accumulator.snapshot()
 	if (snapshot.terminal === 'none' || snapshot.terminal === 'error') return { kind: 'llm_unavailable', message: streamFailureMessage(snapshot) }
 	// markTerminal only records a terminal together with its response payload, so this guard is unreachable by construction; the type still allows the absence and the failure mode is a silent crash if it were ignored.
@@ -276,6 +285,9 @@ const LLM_STREAM_IDLE_TIMEOUT_MS = 120_000
 // The API key is a runtime credential (ORCHESTRATOR_API_KEY), so it rides as its own argument rather than a field on the model config — the deployment config file must never carry it. The caller takes the resolved model: the executor only ever runs with a complete model.
 export function createLlmCaller(model: ResolvedModelConfig, apiKey: string | undefined, dependencies: LlmCallerDependencies): LlmCaller {
 	async function call(request: LlmRequest): Promise<LlmCallResult> {
+		// The gate may already be closed (a run resumed from a pause, or a submission while paused): never start a request the pause would immediately abort. A helper keeps TypeScript from narrowing the signal's `aborted` to false across the awaits below.
+		const abortedByPause = (): boolean => request.signal?.aborted === true
+		if (abortedByPause()) return { kind: 'paused' }
 		const mappedHistory = mapHistoryToResponsesInput(request.messages)
 		const body: Record<string, unknown> = {
 			model: model.name,
@@ -313,10 +325,13 @@ export function createLlmCaller(model: ResolvedModelConfig, apiKey: string | und
 			// The connect phase is bounded by an abort, not a race: aborting the fetch both unblocks the await below and releases the socket, and the timer is cancelled the moment the response headers arrive.
 			const connectController = new AbortController()
 			const cancelConnectTimeout = dependencies.scheduleTimeout(() => connectController.abort(), LLM_CONNECT_TIMEOUT_MS)
+			const fetchSignal = request.signal === undefined ? connectController.signal : AbortSignal.any([connectController.signal, request.signal])
 			let response: LlmStreamResponse
 			try {
-				response = await dependencies.llmFetch({ url: `${model.apiBase}/responses`, method: 'POST', headers, body: JSON.stringify(body), signal: connectController.signal })
+				response = await dependencies.llmFetch({ url: `${model.apiBase}/responses`, method: 'POST', headers, body: JSON.stringify(body), signal: fetchSignal })
 			} catch (error) {
+				// A pause abort is not a transport failure: the engine holds the turn and re-issues it after resume, so no retry is counted.
+				if (abortedByPause()) return { kind: 'paused' }
 				// An aborted fetch is the connect timeout firing, not a plain network failure, so the retry message names the bound that tripped.
 				if (connectController.signal.aborted) {
 					lastError = `no response headers within ${LLM_CONNECT_TIMEOUT_MS}ms`
@@ -346,7 +361,7 @@ export function createLlmCaller(model: ResolvedModelConfig, apiKey: string | und
 				return { kind: 'llm_unavailable', message: `HTTP ${response.status}: ${response.errorBody}` }
 			}
 
-			const consumed = await consumeResponsesStream(response.stream, { idleTimeoutMs: LLM_STREAM_IDLE_TIMEOUT_MS, scheduleTimeout: dependencies.scheduleTimeout, onDelta: emitAttemptDelta })
+			const consumed = await consumeResponsesStream(response.stream, { idleTimeoutMs: LLM_STREAM_IDLE_TIMEOUT_MS, scheduleTimeout: dependencies.scheduleTimeout, onDelta: emitAttemptDelta, signal: request.signal })
 			// An idle timeout is a transport-liveness failure like a failed connect, so it is retried with backoff instead of ending the loop the way every other stream failure does; the fold already released the reader on its exit path.
 			if (consumed.kind === 'stream_idle_timeout') {
 				lastError = consumed.message
